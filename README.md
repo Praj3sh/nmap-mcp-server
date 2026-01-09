@@ -42,7 +42,7 @@ If using Claude Desktop,
 
 ## Starting and using with Claude Desktop
 
-      ./run.sh            
+      sudo ./run.sh            
 
 <img width="870" height="567" alt="image" src="https://github.com/user-attachments/assets/b93e8104-f8d3-491d-ba4f-e1997a702dd0" />
 
