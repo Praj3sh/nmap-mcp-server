@@ -26,6 +26,11 @@ Make the `run.sh` file executable
 
       chmod +x run.sh                     
 
+Change ownership of file to allow mcp to save scans.
+
+      sudo chown -R kali:kali ABSOLUTE_PATH_TO_DIRECTORY
+                   
+
 If using Claude Desktop,
 
  add or rename `nmap_config.json` to `claude_desktop_config.config` and move to `~/.config/Claude/`
