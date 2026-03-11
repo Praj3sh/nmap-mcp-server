@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "nmap": {
-      "command": "/path/to/project_directory/venv/bin/python",
-      "args": ["/path/to/project_directory/nmap_server.py"]
+      "command": "/ABSOLUTE/PATH/TO/venv/bin/python",
+      "args": ["/ABSOLUTE/PATH/TO/nmap_server.py"]
     }
   }
 }
