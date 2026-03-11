@@ -26,9 +26,9 @@ Make the `run.sh` file executable
 
       chmod +x run.sh                     
 
-Change ownership of file to allow mcp to save scans.
+Change ownership of directory to allow mcp to save scans.
 
-      sudo chown -R kali:kali ABSOLUTE_PATH_TO_DIRECTORY
+      sudo chown -R $USER:$USER ABSOLUTE_PATH_TO_DIRECTORY
                    
 
 If using Claude Desktop,
