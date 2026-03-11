@@ -19,230 +19,212 @@ RECOMMENDED:
 import os
 import sys
 import uuid
-import subprocess
-import ipaddress
 import signal
-from typing import List, Optional
+import subprocess
+from typing import Optional
 
 from fastmcp import FastMCP
-from pydantic import BaseModel, Field
 
-# -------------------------------------------------------------------
-# Hardening / Constants
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
 NMAP_BIN = "/usr/bin/nmap"
-SCAN_DIR = "scans"
-SCAN_TIMEOUT = 600  # Longer timeout for NSE
+SCAN_DIR  = os.path.join(os.path.dirname(__file__), "scans")
+TIMEOUT   = 600
+
 os.makedirs(SCAN_DIR, exist_ok=True)
 
-# -------------------------------------------------------------------
-# NSE Controls
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Scan profiles
+# ---------------------------------------------------------------------------
 
-ALLOWED_NSE_CATEGORIES = {
-    "default",
-    "safe",
-    "discovery",
-    "auth",
-    "vuln",
-    "intrusive"  # allowed, but requires dangerous flag
-}
-
-BLOCKED_NSE_KEYWORDS = {
-    "dos",
-    "brute",
-    "exploit"
-}
-
-# -------------------------------------------------------------------
-# Scan Profiles
-# -------------------------------------------------------------------
-
-SCAN_PROFILES = {
-    "safe": {
-        "description": "Low-noise scan (no NSE, internal only)",
+PROFILES = {
+    "quick": {
+        "description": "Fast TCP connect scan of top 100 ports, no NSE",
+        "args": ["-sT", "--top-ports", "100", "-T4"],
+        "needs_root": False,
+    },
+    "standard": {
+        "description": "TCP connect scan + service/version detection, top 1000 ports",
         "args": ["-sT", "-sV", "--top-ports", "1000", "-T3"],
-        "internet": False,
-        "nse": False
+        "needs_root": False,
     },
     "syn": {
-        "description": "SYN scan with service detection",
+        "description": "SYN stealth scan + service detection (requires root/caps)",
         "args": ["-sS", "-sV", "-T4"],
-        "internet": True,
-        "nse": False
+        "needs_root": True,
     },
-    "nse-vuln": {
-        "description": "Vulnerability NSE scan (authorized targets only)",
-        "args": ["-sS", "-sV", "-T4"],
-        "internet": True,
-        "nse": True
+    "vuln": {
+        "description": "SYN scan + vulnerability NSE scripts (requires root/caps)",
+        "args": ["-sS", "-sV", "--script", "vuln", "-T4"],
+        "needs_root": True,
     },
-    "aggressive": {
-        "description": "Aggressive scan (-A) with NSE",
+    "full": {
+        "description": "Aggressive scan: OS detect, version, scripts, traceroute (requires root/caps)",
         "args": ["-A", "-T4"],
-        "internet": True,
-        "nse": True
-    }
+        "needs_root": True,
+    },
 }
 
-# -------------------------------------------------------------------
-# MCP Setup
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# MCP server
+# ---------------------------------------------------------------------------
 
-mcp = FastMCP(
-    name="nmap-mcp"
-)
+mcp = FastMCP("nmap-mcp")
 
-# -------------------------------------------------------------------
-# Models
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
 
-class NmapScanRequest(BaseModel):
-    target: str = Field(description="IP or domain name")
-    profile: str = Field(description="Scan profile")
-    nse_category: Optional[str] = Field(
-        default=None,
-        description="NSE category (e.g. vuln, discovery)"
-    )
-    dangerous: bool = Field(
-        default=False,
-        description="Explicitly allow dangerous scans"
-    )
-    user_acknowledged: bool = Field(
-        default=False,
-        description="User confirms authorization and legality"
-    )
-
-class ScanResultRequest(BaseModel):
-    scan_id: str
-
-# -------------------------------------------------------------------
-# Helper Functions
-# -------------------------------------------------------------------
-
-def is_private_ip(target: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(target)
-        return ip.is_private
-    except ValueError:
-        return False
-
-def validate_nse(category: str, dangerous: bool):
-    if category not in ALLOWED_NSE_CATEGORIES:
-        raise ValueError("NSE category not allowed")
-
-    for blocked in BLOCKED_NSE_KEYWORDS:
-        if blocked in category:
-            raise ValueError("Blocked NSE category")
-
-    if category in {"intrusive", "vuln"} and not dangerous:
-        raise ValueError("Dangerous NSE requires dangerous=true")
-
-def build_command(req: NmapScanRequest, output_file: str) -> List[str]:
-    profile = SCAN_PROFILES[req.profile]
-
-    cmd = [NMAP_BIN, *profile["args"]]
-
-    # NSE handling
-    if profile["nse"]:
-        if not req.nse_category:
-            raise ValueError("NSE category required for this profile")
-
-        validate_nse(req.nse_category, req.dangerous)
-        cmd += ["--script", req.nse_category]
-
-    cmd += ["-oX", output_file, req.target]
-    return cmd
-
-# -------------------------------------------------------------------
-# MCP Tools
-# -------------------------------------------------------------------
-
-@mcp.tool()
-def list_scan_profiles() -> dict:
+@mcp.tool
+def list_profiles() -> dict:
+    """
+    List all available nmap scan profiles.
+    Returns profile names with descriptions and whether root/caps are needed.
+    """
     return {
         name: {
             "description": p["description"],
-            "internet": p["internet"],
-            "nse": p["nse"]
+            "needs_root_or_caps": p["needs_root"],
         }
-        for name, p in SCAN_PROFILES.items()
+        for name, p in PROFILES.items()
     }
 
-@mcp.tool()
-def run_nmap_scan(req: NmapScanRequest) -> dict:
-    if req.profile not in SCAN_PROFILES:
-        return {"error": "Invalid scan profile"}
 
-    profile = SCAN_PROFILES[req.profile]
+@mcp.tool
+def run_scan(
+    target: str,
+    profile: str = "standard",
+    extra_args: str = "",
+    confirmed: bool = False,
+) -> dict:
+    """
+    Run an nmap scan against a target and return the scan ID.
 
-    # Internet scanning requires explicit acknowledgement
-    if profile["internet"]:
-        if not (req.dangerous and req.user_acknowledged):
-            return {
-                "error": "Internet scanning requires dangerous=true and user_acknowledged=true"
-            }
+    Args:
+        target:     IP address, hostname, or CIDR range to scan.
+        profile:    Scan profile name. Use list_profiles() to see options. Default: standard.
+        extra_args: Optional extra nmap flags appended verbatim (e.g. "-p 80,443").
+        confirmed:  Must be set to true to confirm you are authorized to scan this target.
 
-    # Internal-only enforcement
-    if not profile["internet"] and not is_private_ip(req.target):
-        return {"error": "This profile is restricted to private targets"}
+    Returns a dict with scan_id on success, or an error key on failure.
+    """
+    if not confirmed:
+        return {
+            "error": "You must set confirmed=true to acknowledge you are authorized to scan this target."
+        }
 
-    scan_id = str(uuid.uuid4())
+    if profile not in PROFILES:
+        names = ", ".join(PROFILES.keys())
+        return {"error": f"Unknown profile '{profile}'. Valid profiles: {names}"}
+
+    if not target or not target.strip():
+        return {"error": "target must not be empty"}
+
+    scan_id     = str(uuid.uuid4())
     output_file = os.path.join(SCAN_DIR, f"{scan_id}.xml")
 
-    try:
-        cmd = build_command(req, output_file)
+    cmd = [NMAP_BIN] + PROFILES[profile]["args"]
 
+    if extra_args.strip():
+        cmd += extra_args.strip().split()
+
+    cmd += ["-oX", output_file, target.strip()]
+
+    try:
         subprocess.run(
             cmd,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=SCAN_TIMEOUT,
+            stderr=subprocess.PIPE,
+            timeout=TIMEOUT,
             check=True,
-            env={}
         )
-
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode(errors="replace") if e.stderr else ""
+        return {"error": f"nmap exited with code {e.returncode}", "stderr": stderr}
+    except subprocess.TimeoutExpired:
+        return {"error": f"Scan timed out after {TIMEOUT}s"}
+    except FileNotFoundError:
+        return {"error": f"nmap binary not found at {NMAP_BIN}"}
     except Exception as e:
         return {"error": str(e)}
 
     return {
         "scan_id": scan_id,
-        "target": req.target,
-        "profile": req.profile,
-        "nse_category": req.nse_category
+        "target":  target,
+        "profile": profile,
     }
 
-@mcp.tool()
-def get_scan_xml(req: ScanResultRequest) -> dict:
-    path = os.path.join(SCAN_DIR, f"{req.scan_id}.xml")
-    if not os.path.exists(path):
-        return {"error": "Scan not found"}
 
-    with open(path, "r") as f:
+@mcp.tool
+def get_scan_result(scan_id: str) -> dict:
+    """
+    Retrieve the XML output of a completed scan.
+
+    Args:
+        scan_id: The scan ID returned by run_scan.
+
+    Returns a dict with an 'xml' key containing the full nmap XML output.
+    """
+    safe_id = os.path.basename(scan_id)  # path traversal guard
+    path = os.path.join(SCAN_DIR, f"{safe_id}.xml")
+
+    if not os.path.exists(path):
+        return {"error": f"No scan found with id '{scan_id}'"}
+
+    with open(path, "r", encoding="utf-8") as f:
         return {"xml": f.read()}
 
-# -------------------------------------------------------------------
-# Signal Handling (CLEAN SHUTDOWN)
-# -------------------------------------------------------------------
+
+@mcp.tool
+def list_scans() -> dict:
+    """
+    List all scan IDs that have completed results stored on disk.
+    """
+    try:
+        files = [
+            f.removesuffix(".xml")
+            for f in os.listdir(SCAN_DIR)
+            if f.endswith(".xml")
+        ]
+        return {"scan_ids": sorted(files)}
+    except Exception as e:
+        return {"error": str(e)}
 
 
-def _handle_signal(signum, frame):
-    print("\n[*] SIGINT received, forcing MCP server shutdown...", file=sys.stderr)
+@mcp.tool
+def delete_scan(scan_id: str) -> dict:
+    """
+    Delete a stored scan result from disk.
 
-    # Immediately terminate process (no asyncio, no threads, no stdio waits)
+    Args:
+        scan_id: The scan ID to delete.
+    """
+    safe_id = os.path.basename(scan_id)
+    path = os.path.join(SCAN_DIR, f"{safe_id}.xml")
+
+    if not os.path.exists(path):
+        return {"error": f"No scan found with id '{scan_id}'"}
+
+    os.remove(path)
+    return {"deleted": scan_id}
+
+
+# ---------------------------------------------------------------------------
+# Clean shutdown
+# ---------------------------------------------------------------------------
+
+def _shutdown(signum, frame):
+    print("\n[nmap-mcp] shutting down", file=sys.stderr)
     os._exit(0)
 
-signal.signal(signal.SIGINT, _handle_signal)
-signal.signal(signal.SIGTERM, _handle_signal)
+signal.signal(signal.SIGINT,  _shutdown)
+signal.signal(signal.SIGTERM, _shutdown)
 
-
-# -------------------------------------------------------------------
-# Entry
-# -------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-	try:
-	    mcp.run()
-	except KeyboardInterrupt:
-	    print("[*] MCP server interrupted, shutting down cleanly...", file=sys.stderr)
+    mcp.run()
